@@ -91,7 +91,7 @@ export function AppointmentDetailDialog({ appointment, open, onOpenChange, check
   const handleQuickStatus = async (newStatus: string) => {
     if (!appointment) return;
     await updateAppointment.mutateAsync({ id: appointment.id, status: newStatus });
-    if (newStatus === "cancelled") { findReplacements(appointment); return; }
+    if (newStatus === "cancelled") { const a = appointment; onOpenChange(false); findReplacements(a); return; }
     if (newStatus === "completed") {
       onOpenChange(false);
       setWrapUpOpen(true);
