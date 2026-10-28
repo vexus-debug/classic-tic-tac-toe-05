@@ -1,4 +1,8 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
+import { useOrg } from "@/hooks/useOrg";
+import { askClinicAi, rxSafetyPrompt } from "@/lib/aiDental";
+import { ShieldAlert, ShieldCheck, Loader2 } from "lucide-react";
+import { toast } from "@/hooks/use-toast";
 import { useForm, useFieldArray } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -148,12 +152,46 @@ export function CreatePrescriptionDialog({ open, onOpenChange, preselectedPatien
     replace(template.medications);
   }
 
-  function onSubmit(data: PrescriptionForm) {
+  const { currentOrg } = useOrg();
+  const [checking, setChecking] = useState(false);
+  const [safety, setSafety] = useState<{ key: string; warnings: string[] } | null>(null);
+  const [rationale, setRationale] = useState("");
+  useEffect(() => { if (open) { setSafety(null); setRationale(""); } }, [open]);
+  const medKey = (d: PrescriptionForm) => d.patientId + "::" + d.medications.map((m) => `${m.name} ${m.dosage} ${m.frequency} ${m.duration}`).join(";");
+
+  async function runSafetyCheck(data: PrescriptionForm) {
+    if (!currentOrg?.org_id) return null;
+    setChecking(true);
+    try {
+      const reply = await askClinicAi(currentOrg.org_id, rxSafetyPrompt(data.patientId, data.medications.map((m) => `${m.name} ${m.dosage} ${m.frequency} ${m.duration}`)), "rx-safety-check");
+      const warnings = /^\s*NO ISSUES/i.test(reply) ? [] : reply.split("\n").map((l) => l.replace(/^\s*[-*•]\s*/, "").trim()).filter(Boolean);
+      const res = { key: medKey(data), warnings };
+      setSafety(res);
+      return res;
+    } catch (e: any) {
+      toast({ title: "Safety check unavailable", description: `${e?.message || ""} You can still review manually and save.` });
+      const res = { key: medKey(data), warnings: [] };
+      setSafety(res);
+      return res;
+    } finally { setChecking(false); }
+  }
+
+  async function onSubmit(data: PrescriptionForm) {
+    let res = safety;
+    if (!res || res.key !== medKey(data)) {
+      res = await runSafetyCheck(data);
+      if (res && res.warnings.length) return; // show warnings first
+    }
+    if (res && res.warnings.length && !rationale.trim()) {
+      toast({ title: "Rationale required", description: "Explain why you are proceeding despite the safety warnings.", variant: "destructive" });
+      return;
+    }
     createPrescription.mutate(
       {
         patient_id: data.patientId,
         dentist_id: data.dentistId,
         diagnosis: data.diagnosis || undefined,
+        notes: res && res.warnings.length ? `Safety warnings overridden by clinician. Rationale: ${rationale.trim()}\nWarnings: ${res.warnings.join(" / ")}` : undefined,
         medications: data.medications as { name: string; dosage: string; frequency: string; duration: string }[],
       },
       {
@@ -281,10 +319,24 @@ export function CreatePrescriptionDialog({ open, onOpenChange, preselectedPatien
               </Button>
             </div>
 
+            {safety && safety.key === medKey(form.getValues()) && (
+              safety.warnings.length === 0 ? (
+                <p className="flex items-center gap-1.5 rounded-lg bg-muted/40 p-2 text-xs text-muted-foreground"><ShieldCheck className="h-3.5 w-3.5 text-secondary" /> AI safety check found no concerns. Clinical judgement still applies.</p>
+              ) : (
+                <div className="rounded-lg border border-destructive/40 bg-destructive/5 p-3 space-y-2">
+                  <p className="flex items-center gap-1.5 text-sm font-medium text-destructive"><ShieldAlert className="h-4 w-4" /> Safety warnings (advisory)</p>
+                  <ul className="space-y-1 text-xs">
+                    {safety.warnings.map((w, i) => <li key={i} className={/^HIGH/i.test(w) ? "font-medium text-destructive" : ""}>• {w}</li>)}
+                  </ul>
+                  <Textarea rows={2} className="text-sm" placeholder="To proceed, record your clinical rationale (saved with the prescription)" value={rationale} onChange={(e) => setRationale(e.target.value)} />
+                </div>
+              )
+            )}
+
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
-              <Button type="submit" className="bg-secondary hover:bg-secondary/90" disabled={createPrescription.isPending}>
-                {createPrescription.isPending ? "Creating..." : "Create Prescription"}
+              <Button type="submit" className="bg-secondary hover:bg-secondary/90" disabled={createPrescription.isPending || checking}>
+                {checking ? <><Loader2 className="mr-1 h-4 w-4 animate-spin" /> Checking safety...</> : createPrescription.isPending ? "Creating..." : safety?.warnings.length && safety.key === medKey(form.getValues()) ? "Override & create" : "Check & create"}
               </Button>
             </DialogFooter>
           </form>

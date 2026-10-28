@@ -13,6 +13,19 @@ export interface UpdateEntry {
 
 export const updates: UpdateEntry[] = [
   {
+    version: "v2.6.0",
+    date: "October 28, 2026",
+    title: "AI clinical copilot: notes, Rx safety, billing audit, lab alerts, slot fill",
+    kind: "feature",
+    items: [
+      { kind: "feature", text: "Finish visit: \"Draft with AI\" fills editable SOAP notes from today's treatment, chart and procedures." },
+      { kind: "feature", text: "New prescription: AI checks interactions, allergies and contraindications; proceeding past warnings requires a recorded rationale." },
+      { kind: "feature", text: "Finish visit: \"Check missed items\" suggests work done today that isn't on the bill — add or dismiss each." },
+      { kind: "feature", text: "Lab cases: alerts when a patient's delivery appointment in the next 14 days is at risk from a late, overdue or undated case." },
+      { kind: "feature", text: "Cancelling an appointment now ranks the best patients to offer the freed slot." },
+    ],
+  },
+  {
     version: "v2.5.4",
     date: "October 28, 2026",
     title: "AI consent risks and post-op instructions",

@@ -8,6 +8,10 @@ import { CreateLabCaseDialog } from "@/components/dashboard/CreateLabCaseDialog"
 import { LabCaseDetailDialog } from "@/components/dashboard/LabCaseDetailDialog";
 import { format } from "date-fns";
 import { motion } from "framer-motion";
+import { useQuery } from "@tanstack/react-query";
+import { supabase } from "@/integrations/supabase/client";
+import { useOrg } from "@/hooks/useOrg";
+import { AlertTriangle } from "lucide-react";
 
 const statusStyles: Record<string, string> = {
   pending: "bg-muted text-muted-foreground",
@@ -33,6 +37,31 @@ export default function LabCasesPage() {
   const [selectedCase, setSelectedCase] = useState<LabCaseRow | null>(null);
   const { data: cases = [], isLoading } = useLabCases();
   const statuses = ["pending", "in-progress", "ready", "delivered"] as const;
+  const { currentOrg } = useOrg();
+  const openCases = cases.filter((c) => c.patient_id && !["ready", "delivered"].includes(c.status));
+  const patientIds = Array.from(new Set(openCases.map((c) => c.patient_id!)));
+  const { data: upcoming = [] } = useQuery({
+    queryKey: ["lab-conflict-appts", currentOrg?.org_id, patientIds.join(",")],
+    enabled: !!currentOrg?.org_id && patientIds.length > 0,
+    queryFn: async () => {
+      const today = new Date().toISOString().slice(0, 10);
+      const until = new Date(Date.now() + 14 * 864e5).toISOString().slice(0, 10);
+      const { data, error } = await (supabase as any).from("appointments")
+        .select("id, patient_id, appointment_date, appointment_time, status")
+        .eq("org_id", currentOrg!.org_id).in("patient_id", patientIds).eq("status", "scheduled")
+        .gte("appointment_date", today).lte("appointment_date", until).order("appointment_date");
+      if (error) throw error;
+      return data || [];
+    },
+  });
+  // A delivery visit is at risk when the case isn't ready and is due after (or has no due date before) the visit.
+  const conflicts = openCases.flatMap((c) => {
+    const appt = (upcoming as any[]).find((a) => a.patient_id === c.patient_id);
+    if (!appt) return [];
+    const late = !c.due_date || c.due_date.slice(0, 10) >= appt.appointment_date;
+    const overdue = !!c.due_date && new Date(c.due_date) < new Date();
+    return late || overdue ? [{ c, appt, reason: !c.due_date ? "no lab due date set" : overdue ? "lab case is overdue" : `due ${format(new Date(c.due_date), "MMM d")}, on/after the visit` }] : [];
+  });
 
   return (
     <div className="space-y-6">
@@ -46,6 +75,19 @@ export default function LabCasesPage() {
           New Lab Case
         </Button>
       </div>
+
+      {conflicts.length > 0 && (
+        <Card className="border-destructive/40">
+          <CardHeader className="pb-2"><CardTitle className="text-sm flex items-center gap-2"><AlertTriangle className="h-4 w-4 text-destructive" /> Delivery visits at risk ({conflicts.length})</CardTitle></CardHeader>
+          <CardContent className="space-y-2">
+            {conflicts.map(({ c, appt, reason }) => (
+              <button key={c.id} type="button" onClick={() => setSelectedCase(c)} className="w-full text-left rounded-lg border border-border/40 p-2 text-xs hover:bg-muted/40">
+                <span className="font-medium">{c.patients ? `${c.patients.first_name} ${c.patients.last_name}` : "Patient"}</span> · {c.work_type} ({c.case_number}) — appointment {format(new Date(appt.appointment_date), "EEE MMM d")} {appt.appointment_time?.slice(0, 5)}, but {reason}. Confirm with the lab or reschedule.
+              </button>
+            ))}
+          </CardContent>
+        </Card>
+      )}
 
       {isLoading ? (
         <p className="text-sm text-muted-foreground text-center py-10">Loading lab cases...</p>
