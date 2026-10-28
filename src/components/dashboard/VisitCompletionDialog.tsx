@@ -24,6 +24,9 @@ import { toast } from "@/hooks/use-toast";
 import { Package, Trash2, NotebookPen, FlaskConical, Sparkles } from "lucide-react";
 import { Textarea } from "@/components/ui/textarea";
 import { PostOpInstructions } from "@/components/dashboard/PostOpInstructions";
+import { askClinicAi, soapNotePrompt, parseSoap, unbilledAuditPrompt, parseAiLines } from "@/lib/aiDental";
+import { useDentalChartEntries } from "@/hooks/useDentalCharts";
+import { Loader2, SearchCheck } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import {
   AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
@@ -78,6 +81,52 @@ export function VisitCompletionDialog({ open, onOpenChange, patientId, patientNa
   }));
   const addPhrase = (k: keyof typeof emptyNotes, ph: string) =>
     setNotes((n) => ({ ...n, [k]: n[k] ? `${n[k].replace(/\s+$/, "")}${/[:\n]$/.test(n[k].trim()) ? " " : ". "}${ph}` : ph }));
+  const { data: chartEntries = [] } = useDentalChartEntries(open && patientId ? patientId : undefined);
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const todaysFindings = (chartEntries as any[]).filter((e) => e.entry_date === todayStr)
+    .map((e) => `Tooth ${e.tooth_number}: ${String(e.condition || "").replace(/_/g, " ")}${e.surface ? ` (${e.surface})` : ""}${e.notes ? ` – ${e.notes}` : ""}`);
+  const [soapLoading, setSoapLoading] = useState(false);
+  const draftSoap = async () => {
+    if (!orgId || !patientId) return;
+    setSoapLoading(true);
+    try {
+      const reply = await askClinicAi(orgId, soapNotePrompt(patientId, apptTreatment?.name || "", todaysFindings,
+        selected.map((i) => `${i.description}${i.tooth_number ? ` (tooth ${i.tooth_number})` : ""}`)), "soap-note");
+      const d = parseSoap(reply);
+      if (!Object.values(d).some(Boolean)) throw new Error("AI reply could not be read as a SOAP note.");
+      setNotes((n) => ({ subjective: d.subjective || n.subjective, objective: d.objective || n.objective, assessment: d.assessment || n.assessment, plan: d.plan || n.plan }));
+      toast({ title: "SOAP draft ready", description: "Review and edit before finishing the visit." });
+    } catch (e: any) {
+      toast({ title: "Couldn't draft notes", description: e?.message, variant: "destructive" });
+    } finally { setSoapLoading(false); }
+  };
+
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditDone, setAuditDone] = useState(false);
+  const [suggestions, setSuggestions] = useState<{ treatmentId: string; name: string; price: number; reason: string }[]>([]);
+  const [aiLines, setAiLines] = useState<{ key: string; treatmentId: string; description: string; unitPrice: number }[]>([]);
+  useEffect(() => { if (open) { setSuggestions([]); setAiLines([]); setAuditDone(false); } }, [open, patientId]);
+  const runAudit = async () => {
+    if (!orgId || !patientId) return;
+    setAuditLoading(true);
+    try {
+      const billedNames = buildLines().map((l) => l.description);
+      const reply = await askClinicAi(orgId, unbilledAuditPrompt(patientId, billedNames, treatments.map((t) => t.name)), "unbilled-audit");
+      const found = /NOTHING MISSING/i.test(reply) ? [] : parseAiLines(reply).map(([name, reason]) => {
+        const t = treatments.find((x) => x.name.toLowerCase() === (name || "").toLowerCase());
+        return t ? { treatmentId: t.id, name: t.name, price: Number(t.price) || 0, reason: reason || "" } : null;
+      }).filter((x): x is NonNullable<typeof x> => !!x && !billedNames.some((b) => b.toLowerCase().includes(x.name.toLowerCase())));
+      setSuggestions(found);
+      setAuditDone(true);
+    } catch (e: any) {
+      toast({ title: "Audit unavailable", description: e?.message, variant: "destructive" });
+    } finally { setAuditLoading(false); }
+  };
+  const acceptSuggestion = (s: { treatmentId: string; name: string; price: number }) => {
+    setAiLines((l) => [...l, { key: `ai-${s.treatmentId}`, treatmentId: s.treatmentId, description: s.name, unitPrice: s.price }]);
+    setSuggestions((x) => x.filter((y) => y.treatmentId !== s.treatmentId));
+  };
+
   const saveNotes = async (apptId?: string | null) => {
     if (!patientId || !Object.values(notes).some((v) => v.trim())) return;
     const { data: u } = await supabase.auth.getUser();
@@ -205,8 +254,8 @@ export function VisitCompletionDialog({ open, onOpenChange, patientId, patientNa
   const selected = planItems.filter((i) => selectedItems.has(i.id));
   const labTotal = labLines.reduce((s: number, l: any) => s + l.unitPrice, 0);
   const total = useMemo(
-    () => selected.reduce((s, i) => s + Number(i.estimated_cost || 0), 0) + (includeAppt && apptTreatment ? Number(apptTreatment.price || 0) : 0) + labTotal,
-    [selected, includeAppt, apptTreatment, labTotal],
+    () => selected.reduce((s, i) => s + Number(i.estimated_cost || 0), 0) + (includeAppt && apptTreatment ? Number(apptTreatment.price || 0) : 0) + labTotal + aiLines.reduce((s, l) => s + l.unitPrice, 0),
+    [selected, includeAppt, apptTreatment, labTotal, aiLines],
   );
   const buildLines = () => {
     const lines = selected.map((i) => ({
@@ -216,7 +265,7 @@ export function VisitCompletionDialog({ open, onOpenChange, patientId, patientNa
     }));
     if (includeAppt && apptTreatment && !selected.some((i) => i.treatment_id === apptTreatment.id))
       lines.push({ key: `appt-${apptTreatment.id}`, treatmentId: apptTreatment.id, description: apptTreatment.name, unitPrice: Number(apptTreatment.price) || 0 });
-    return [...lines, ...labLines];
+    return [...lines, ...labLines, ...aiLines];
   };
 
   // Fix 5: material suggestions per procedure.
@@ -310,6 +359,29 @@ export function VisitCompletionDialog({ open, onOpenChange, patientId, patientNa
                   <span className="text-sm font-semibold">{naira(i.estimated_cost)}</span>
                 </label>
               ))}
+              {aiLines.map((l) => (
+                <div key={l.key} className="flex items-center gap-3 rounded-lg border border-secondary/40 p-3 text-sm">
+                  <div className="flex-1 min-w-0"><p className="font-medium truncate">{l.description}</p><p className="text-xs text-muted-foreground">Added from AI audit</p></div>
+                  <span className="text-sm font-semibold">{naira(l.unitPrice)}</span>
+                  <Button size="icon" variant="ghost" className="h-6 w-6" aria-label="Remove" onClick={() => setAiLines((x) => x.filter((y) => y.key !== l.key))}><Trash2 className="h-3 w-3" /></Button>
+                </div>
+              ))}
+              <div className="rounded-lg bg-muted/20 p-2 space-y-1.5">
+                <div className="flex items-center justify-between">
+                  <p className="text-[11px] text-muted-foreground">Anything done today but not on the bill?</p>
+                  <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={runAudit} disabled={auditLoading || billed}>
+                    {auditLoading ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <SearchCheck className="h-3 w-3 mr-1" />} Check missed items
+                  </Button>
+                </div>
+                {suggestions.map((sg) => (
+                  <div key={sg.treatmentId} className="flex items-start gap-2 text-xs">
+                    <div className="flex-1 min-w-0"><p className="font-medium">{sg.name} · {naira(sg.price)}</p><p className="text-muted-foreground">{sg.reason}</p></div>
+                    <Button size="sm" variant="outline" className="h-6 text-[11px]" onClick={() => acceptSuggestion(sg)}><Plus className="h-3 w-3 mr-0.5" /> Add</Button>
+                    <Button size="sm" variant="ghost" className="h-6 text-[11px]" onClick={() => setSuggestions((x) => x.filter((y) => y.treatmentId !== sg.treatmentId))}>Dismiss</Button>
+                  </div>
+                ))}
+                {auditDone && suggestions.length === 0 && <p className="text-[11px] text-muted-foreground">No missed items found.</p>}
+              </div>
               {selected.some((i) => i.status !== "completed") && (
                 <p className="text-[11px] text-muted-foreground">Ticked pending items will be marked completed. In-progress items stay in progress.</p>
               )}
@@ -362,7 +434,12 @@ export function VisitCompletionDialog({ open, onOpenChange, patientId, patientNa
             <section className="space-y-2">
               <div className="flex items-center justify-between">
                 <h4 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground flex items-center gap-1.5"><NotebookPen className="h-3.5 w-3.5" /> Visit notes</h4>
-                <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={applyTemplate}>Use template</Button>
+                <div className="flex gap-1">
+                  <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={draftSoap} disabled={soapLoading}>
+                    {soapLoading ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Sparkles className="h-3 w-3 mr-1" />} Draft with AI
+                  </Button>
+                  <Button size="sm" variant="ghost" className="h-7 text-xs" onClick={applyTemplate}>Use template</Button>
+                </div>
               </div>
               {NOTE_FIELDS.map(([k, label]) => (
                 <div key={k} className="space-y-1">
