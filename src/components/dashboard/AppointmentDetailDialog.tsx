@@ -16,6 +16,9 @@ import { useClinicLinks } from "@/hooks/usePatientContext";
 import { useNavigate } from "react-router-dom";
 import { UserCheck, Stethoscope } from "lucide-react";
 import { useOrg } from "@/hooks/useOrg";
+import { toast } from "@/hooks/use-toast";
+import { askClinicAi, fastFillPrompt, parseAiLines } from "@/lib/aiDental";
+import { Sparkles, Loader2 } from "lucide-react";
 
 const statusOptions = ["scheduled", "in-progress", "completed", "cancelled"];
 const chairs = ["Chair 1", "Chair 2", "Chair 3"];
@@ -71,9 +74,24 @@ export function AppointmentDetailDialog({ appointment, open, onOpenChange, check
     onOpenChange(false);
   };
 
+  const [fill, setFill] = useState<{ loading: boolean; slot: string; matches: string[][] | null } | null>(null);
+  const findReplacements = async (a: AppointmentRow) => {
+    if (!currentOrg?.org_id) return;
+    const slot = { date: a.appointment_date, time: a.appointment_time, treatment: a.treatments?.name, dentist: dentists.find((d) => d.id === a.staff_id)?.full_name };
+    setFill({ loading: true, slot: `${slot.date} ${slot.time?.slice(0, 5)}`, matches: null });
+    try {
+      const reply = await askClinicAi(currentOrg.org_id, fastFillPrompt(slot), "fast-fill");
+      setFill({ loading: false, slot: `${slot.date} ${slot.time?.slice(0, 5)}`, matches: /NO MATCHES/i.test(reply) ? [] : parseAiLines(reply).slice(0, 5) });
+    } catch (e: any) {
+      setFill(null);
+      toast({ title: "Couldn't find replacements", description: e?.message, variant: "destructive" });
+    }
+  };
+
   const handleQuickStatus = async (newStatus: string) => {
     if (!appointment) return;
     await updateAppointment.mutateAsync({ id: appointment.id, status: newStatus });
+    if (newStatus === "cancelled") { findReplacements(appointment); return; }
     if (newStatus === "completed") {
       onOpenChange(false);
       setWrapUpOpen(true);
@@ -107,7 +125,31 @@ export function AppointmentDetailDialog({ appointment, open, onOpenChange, check
     />
   );
 
-  if (!appointment) return wrapEl;
+  const fillEl = (
+    <Dialog open={!!fill} onOpenChange={(o) => !o && setFill(null)}>
+      <DialogContent>
+        <DialogHeader><DialogTitle className="flex items-center gap-2"><Sparkles className="h-4 w-4 text-secondary" /> Fill the open slot · {fill?.slot}</DialogTitle></DialogHeader>
+        {fill?.loading ? (
+          <p className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" /> Ranking patients who could take this slot…</p>
+        ) : fill?.matches?.length ? (
+          <ol className="space-y-2">
+            {fill.matches.map((m, i) => (
+              <li key={i} className="rounded-lg border border-border/40 p-3 text-sm">
+                <p className="font-medium">{i + 1}. {m[0]}{m[1] && m.length > 2 ? <span className="text-muted-foreground font-normal"> · {m[1]}</span> : null}</p>
+                <p className="text-xs text-muted-foreground">{m[m.length - 1] !== m[0] ? m[m.length - 1] : ""}</p>
+              </li>
+            ))}
+          </ol>
+        ) : (
+          <p className="text-sm text-muted-foreground">No good matches found. The slot is free for walk-ins or new bookings.</p>
+        )}
+        <p className="text-[11px] text-muted-foreground">Suggestions only — call the patient and book them yourself.</p>
+        <DialogFooter><Button variant="outline" onClick={() => setFill(null)}>Close</Button></DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+
+  if (!appointment) return <>{wrapEl}{fillEl}</>;
 
   const statusColors: Record<string, string> = {
     scheduled: "bg-blue-100 text-blue-700",
@@ -232,6 +274,7 @@ export function AppointmentDetailDialog({ appointment, open, onOpenChange, check
       </Dialog>
 
       {wrapEl}
+      {fillEl}
     </>
   );
 }
